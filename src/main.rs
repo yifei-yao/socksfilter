@@ -7,6 +7,7 @@ use tokio::{
 use std::{
     collections::HashSet,
     fs::File,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{self, BufRead, Error, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr},
     sync::Arc,
@@ -20,10 +21,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn read_denylist(path: &str) -> io::Result<HashSet<String>> {
+struct Filter {
+    set: HashSet<u64>,
+}
+
+impl Filter {
+    fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+        }
+    }
+
+    fn insert(&mut self, s: &str) {
+        self.set.insert(Self::hash(s));
+    }
+
+    fn hash(s: &str) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        s.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn contains(&self, s: &str) -> bool {
+        self.set.contains(&Self::hash(s))
+    }
+
+    fn len(&self) -> usize {
+        self.set.len()
+    }
+}
+
+fn read_denylist(path: &str) -> io::Result<Filter> {
     let file = File::open(path)?;
     let reader = io::BufReader::new(file);
-    let mut hashset = HashSet::new();
+    let mut filter = Filter::new();
     for line in reader.lines() {
         let line = line?;
         let line = match line.split_once('#') {
@@ -32,14 +63,14 @@ fn read_denylist(path: &str) -> io::Result<HashSet<String>> {
         };
         let line = line.trim().to_lowercase();
         if !line.is_empty() {
-            hashset.insert(line);
+            filter.insert(&line);
         }
     }
-    println!("{}", hashset.len());
-    Ok(hashset)
+    println!("{}", filter.len());
+    Ok(filter)
 }
 
-async fn start_service(port: u16, denylist: Arc<HashSet<String>>) -> Result<(), Error> {
+async fn start_service(port: u16, denylist: Arc<Filter>) -> Result<(), Error> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     loop {
         let (stream, _) = listener.accept().await?;
@@ -52,7 +83,7 @@ async fn start_service(port: u16, denylist: Arc<HashSet<String>>) -> Result<(), 
     }
 }
 
-fn in_denylist(domain: &str, denylist: &HashSet<String>) -> bool {
+fn in_denylist(domain: &str, denylist: &Filter) -> bool {
     let mut parts = domain.rsplit('.');
     let mut current = if let Some(part) = parts.next() {
         part.to_owned()
@@ -74,7 +105,7 @@ fn in_denylist(domain: &str, denylist: &HashSet<String>) -> bool {
 async fn process_local_stream(
     mut tcp_stream: TcpStream,
     port: u16,
-    denylist: Arc<HashSet<String>>,
+    denylist: Arc<Filter>,
 ) -> Result<(), std::io::Error> {
     // Communicate request type
 
