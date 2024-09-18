@@ -77,9 +77,19 @@ async fn process_local_stream(
     denylist: Arc<HashSet<String>>,
 ) -> Result<(), std::io::Error> {
     // Communicate request type
-    let mut buffer = [0u8; 3];
+
+    if tcp_stream.read_u8().await? != 5 {
+        return Err(Error::new(ErrorKind::InvalidData, "Invalid version"));
+    }
+    let n_mehtods = tcp_stream.read_u8().await?;
+    if n_mehtods == 0 {
+        return Err(Error::new(ErrorKind::InvalidData, "Invalid nmethods"));
+    }
+    let mut buffer = vec![0u8; n_mehtods as usize];
     tcp_stream.read_exact(&mut buffer).await?;
-    if buffer != [5, 1, 0] {
+
+    if !buffer.contains(&0) {
+        eprintln!("{:?}", buffer);
         return Err(Error::new(ErrorKind::InvalidData, "Invalid SOCKS5 request"));
     }
     tcp_stream.write_all(&[5, 0]).await?;
@@ -88,6 +98,7 @@ async fn process_local_stream(
     let mut buffer = [0u8; 3];
     tcp_stream.read_exact(&mut buffer).await?;
     if buffer != [5, 1, 0] {
+        // eprintln!("{:?}", buffer);
         return Err(Error::new(ErrorKind::InvalidData, "Invalid SOCKS5 request"));
     }
     let socket_addr = read_addr(&mut tcp_stream).await?;
