@@ -1,3 +1,4 @@
+use qfilter::Filter;
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -5,9 +6,7 @@ use tokio::{
 };
 
 use std::{
-    collections::HashSet,
     fs::File,
-    hash::{DefaultHasher, Hash, Hasher},
     io::{self, BufRead, Error, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr},
     sync::Arc,
@@ -21,40 +20,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct Filter {
-    set: HashSet<u64>,
+struct DomainSet {
+    set: Filter,
 }
 
-impl Filter {
-    fn new() -> Self {
+impl DomainSet {
+    fn new(capacity: u64) -> Self {
         Self {
-            set: HashSet::new(),
+            set: Filter::new(capacity, 0.000000001).unwrap(),
         }
     }
 
     fn insert(&mut self, s: &str) {
-        self.set.insert(Self::hash(s));
-    }
-
-    fn hash(s: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        s.hash(&mut hasher);
-        hasher.finish()
+        self.set.insert(s).unwrap();
     }
 
     fn contains(&self, s: &str) -> bool {
-        self.set.contains(&Self::hash(s))
-    }
-
-    fn len(&self) -> usize {
-        self.set.len()
+        self.set.contains(s)
     }
 }
 
-fn read_denylist(path: &str) -> io::Result<Filter> {
+fn read_denylist(path: &str) -> io::Result<DomainSet> {
     let file = File::open(path)?;
     let reader = io::BufReader::new(file);
-    let mut filter = Filter::new();
+    let mut valid_entry_count = 0;
+
+    for line in reader.lines() {
+        let line = line?;
+        let line = match line.split_once('#') {
+            Some((before_comment, _)) => before_comment,
+            None => &line,
+        };
+        let line = line.trim().to_lowercase();
+        if !line.is_empty() {
+            valid_entry_count += 1;
+        }
+    }
+
+    let mut filter = DomainSet::new(valid_entry_count);
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
     for line in reader.lines() {
         let line = line?;
         let line = match line.split_once('#') {
@@ -66,11 +71,10 @@ fn read_denylist(path: &str) -> io::Result<Filter> {
             filter.insert(&line);
         }
     }
-    println!("{}", filter.len());
     Ok(filter)
 }
 
-async fn start_service(port: u16, denylist: Arc<Filter>) -> Result<(), Error> {
+async fn start_service(port: u16, denylist: Arc<DomainSet>) -> Result<(), Error> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     loop {
         let (stream, _) = listener.accept().await?;
@@ -83,7 +87,7 @@ async fn start_service(port: u16, denylist: Arc<Filter>) -> Result<(), Error> {
     }
 }
 
-fn in_denylist(domain: &str, denylist: &Filter) -> bool {
+fn in_denylist(domain: &str, denylist: &DomainSet) -> bool {
     let mut parts = domain.rsplit('.');
     let mut current = if let Some(part) = parts.next() {
         part.to_owned()
@@ -105,7 +109,7 @@ fn in_denylist(domain: &str, denylist: &Filter) -> bool {
 async fn process_local_stream(
     mut tcp_stream: TcpStream,
     port: u16,
-    denylist: Arc<Filter>,
+    denylist: Arc<DomainSet>,
 ) -> Result<(), std::io::Error> {
     // Communicate request type
 
