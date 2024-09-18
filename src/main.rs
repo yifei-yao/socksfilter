@@ -1,6 +1,6 @@
 use qfilter::Filter;
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt, BufStream},
     net::{TcpListener, TcpStream},
     time::sleep,
 };
@@ -107,12 +107,12 @@ fn in_denylist(domain: &str, denylist: &DomainSet) -> bool {
 // Does socks5 handshake, and based on domain name, either
 // blocks the request or fullfills the request
 async fn process_local_stream(
-    mut tcp_stream: TcpStream,
+    tcp_stream: TcpStream,
     port: u16,
     denylist: Arc<DomainSet>,
 ) -> Result<(), std::io::Error> {
     // Communicate request type
-
+    let mut tcp_stream = BufStream::new(tcp_stream);
     if tcp_stream.read_u8().await? != 5 {
         return Err(Error::new(ErrorKind::InvalidData, "Invalid version"));
     }
@@ -128,6 +128,7 @@ async fn process_local_stream(
         return Err(Error::new(ErrorKind::InvalidData, "Invalid SOCKS5 request"));
     }
     tcp_stream.write_all(&[5, 0]).await?;
+    tcp_stream.flush().await?;
 
     // Read target address
     let mut buffer = [0u8; 3];
@@ -164,8 +165,9 @@ async fn process_local_stream(
     tcp_stream.write_u8(1).await?;
     tcp_stream.write_all(&[127, 0, 0, 1]).await?;
     tcp_stream.write_u16(port).await?;
+    tcp_stream.flush().await?;
     if let Ok(mut remote_stream) = remote {
-        copy_bidirectional(&mut tcp_stream, &mut remote_stream).await?;
+        copy_bidirectional(&mut tcp_stream.into_inner(), &mut remote_stream).await?;
     }
     Ok(())
 }
@@ -191,7 +193,7 @@ async fn connect_remote(socksaddr: SocksAddr) -> io::Result<TcpStream> {
     }
 }
 
-async fn read_addr(reader: &mut TcpStream) -> Result<SocksAddr, Error> {
+async fn read_addr(reader: &mut BufStream<TcpStream>) -> Result<SocksAddr, Error> {
     let atyp = reader.read_u8().await?;
     match atyp {
         1 => {
