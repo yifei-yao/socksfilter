@@ -1,35 +1,81 @@
 use tokio::{
     io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    time::sleep,
 };
 
 use std::{
-    io::{self, Error, ErrorKind},
+    collections::HashSet,
+    fs::File,
+    io::{self, BufRead, Error, ErrorKind},
     net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+    time::Duration,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    start_service(1080).await?;
+    let hash_set = Arc::new(read_denylist("denylist.txt")?);
+    start_service(1080, hash_set).await?;
     Ok(())
 }
 
-async fn start_service(port: u16) -> Result<(), Error> {
+fn read_denylist(path: &str) -> io::Result<HashSet<String>> {
+    let file = File::open(path)?;
+    let reader = io::BufReader::new(file);
+    let mut hashset = HashSet::new();
+    for line in reader.lines() {
+        let line = line?;
+        let line = match line.split_once('#') {
+            Some((before_comment, _)) => before_comment,
+            None => &line,
+        };
+        let line = line.trim().to_lowercase();
+        if !line.is_empty() {
+            hashset.insert(line);
+        }
+    }
+    println!("{}", hashset.len());
+    Ok(hashset)
+}
+
+async fn start_service(port: u16, denylist: Arc<HashSet<String>>) -> Result<(), Error> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     loop {
         let (stream, _) = listener.accept().await?;
-
+        let denylist = denylist.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_local_stream(stream, port).await {
+            if let Err(e) = process_local_stream(stream, port, denylist).await {
                 eprintln!("{e}");
             }
         });
     }
 }
 
+fn in_denylist(domain: &str, denylist: &HashSet<String>) -> bool {
+    let mut parts = domain.rsplit('.');
+    let mut current = if let Some(part) = parts.next() {
+        part.to_owned()
+    } else {
+        return false;
+    };
+    for part in parts {
+        current = format!("{}.{}", part, current);
+        if denylist.contains(&current) {
+            println!("Domain: {domain} blocked");
+            return true;
+        }
+    }
+    false
+}
+
 // Does socks5 handshake, and based on domain name, either
 // blocks the request or fullfills the request
-async fn process_local_stream(mut tcp_stream: TcpStream, port: u16) -> Result<(), std::io::Error> {
+async fn process_local_stream(
+    mut tcp_stream: TcpStream,
+    port: u16,
+    denylist: Arc<HashSet<String>>,
+) -> Result<(), std::io::Error> {
     // Communicate request type
     let mut buffer = [0u8; 3];
     tcp_stream.read_exact(&mut buffer).await?;
@@ -46,7 +92,12 @@ async fn process_local_stream(mut tcp_stream: TcpStream, port: u16) -> Result<()
     }
     let socket_addr = read_addr(&mut tcp_stream).await?;
 
-    // Todo: filter out domains
+    if let Address::Domain(domain) = &socket_addr.address {
+        if in_denylist(domain, &denylist) {
+            sleep(Duration::from_secs(300)).await;
+            return Ok(());
+        }
+    }
 
     // Proceed to forward the conneciton
     let remote = connect_remote(socket_addr.clone()).await;
@@ -87,7 +138,6 @@ enum Address {
 }
 
 async fn connect_remote(socksaddr: SocksAddr) -> io::Result<TcpStream> {
-    println!("{:?}", socksaddr);
     match socksaddr.address {
         Address::V4(ipv4) => TcpStream::connect((ipv4, socksaddr.port)).await,
         Address::V6(ipv6) => TcpStream::connect((ipv6, socksaddr.port)).await,
@@ -110,13 +160,11 @@ async fn read_addr(reader: &mut TcpStream) -> Result<SocksAddr, Error> {
             })
         }
         3 => {
-            println!("Domain name requested");
             let length = reader.read_u8().await?;
             let mut domain_buf = vec![0u8; length as usize];
             reader.read_exact(&mut domain_buf).await?;
             let domain_name = String::from_utf8_lossy(&domain_buf).to_string();
             let port = reader.read_u16().await?;
-            println!("Connecting to domain: {} on port {}", domain_name, port);
             Ok(SocksAddr {
                 address: Address::Domain(domain_name),
                 port,
